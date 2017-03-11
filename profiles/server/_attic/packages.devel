@@ -1,0 +1,6 @@
+app-arch/cpio
+app-misc/screen
+app-misc/vlock
+sys-libs/gpm
+sys-fs/squashfs-tools
+

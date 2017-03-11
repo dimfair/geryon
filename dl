@@ -1,0 +1,100 @@
+#!/bin/sh
+
+source /etc/portage/make.conf
+
+DATE="$(date "+%F")"
+TRIES=15
+SITE="http://distfiles.gentoo.org"
+DIR="/releases/amd64/autobuilds/current-stage3-amd64"
+NAME="stage3-amd64-nomultilib"
+#NAME="stage3-amd64"
+SUFX=".tar.bz2"
+
+YY="$(echo $DATE | cut -f1 -d- | sed -e "s/^0\+//")"
+MM="$(echo $DATE | cut -f2 -d- | sed -e "s/^0\+//")"
+DD="$(echo $DATE | cut -f3 -d- | sed -e "s/^0\+//")"
+
+check_digest() {
+	local _file1="$1"
+	local _file2="$_file1.DIGESTS"
+	local _out=
+
+	if _out=$(openssl dgst -sha512 $_file1); then
+		local _type=$(echo "$_out" | sed -e 's/\([^(]\+\).\+/\1/')
+		local _file=$(echo "$_out" | sed -e 's/[^(]\+(\([^)]\+\).\+/\1/')
+		local _hash=$(echo "$_out" | sed -e 's/[^=]\+= \?\(.\+\)/\1/')
+		local _real=$(cat $_file2 | sed -n '/# SHA512 HASH/{n;p;}' | grep -E " $_file1$" | cut -f1 -d' ')
+
+		[ "$_type" == "SHA512" ] && [ "$_file" == "$_file1" ] && [ "$_hash" == "$_real" ] && true
+	else
+		false
+	fi
+}
+
+download_files() {
+	local COUNT=0
+	local ERRCODE=1
+
+	while [ "$COUNT" != "$TRIES" ]; do
+		sleep 1
+		local _date="$YY$(printf '%02d' $MM)$(printf '%02d' $DD)"
+		#local _date="$YY$MM$DD"
+		local _file="${NAME}-${_date}${SUFX}"
+		local _url="${SITE}${DIR}/${_file}"
+
+		[ "$COUNT" == "0" ] && echo "${SITE}${DIR}:" >&2
+		echo -n "  $_file: " >&2
+		wget -q "$_url"
+		case "$?" in
+			0) echo "ok" >&2
+			   sleep 1
+			   if wget -q "${_url}.DIGESTS"; then
+			   	if check_digest "$_file"; then
+					if ! cmp -s "$_file" "$DISTDIR/$NAME$SUFX"; then
+						mv "$_file" "$DISTDIR"
+						ERRCODE=0
+					fi
+			   	else
+					echo "checksum failed" >&2
+			   	fi
+			   else
+				echo "failed to load digest file"
+			   fi
+			   break
+			   ;;
+			8) echo "not found" >&2
+			   ;;
+			*) echo "Unknown error" >&2
+			   return 1 ;;
+		esac
+
+		DD="$((${DD} - 1))"
+		if [ "$DD" == "0" ]; then 
+			DD="31"
+			MM="$((${MM} - 1))"
+			if [ "$MM" == "0" ]; then
+				MM="12"
+				YY="$((${YY} - 1))"
+			fi
+		fi
+
+		COUNT=$((${COUNT} + 1))
+	done
+
+	[ "$ERRCODE" == "0" ]
+}
+
+
+TEMPDIR=${TMPDIR:-/tmp}
+WRKDIR=$(mktemp --tmpdir=$TEMPDIR -d dl.XXXXXX)
+DISTDIR=${DISTDIR:-/tmp/portage/distfiles}
+
+pushd $WRKDIR > /dev/null
+mkdir -p $DISTDIR
+download_files
+RESULT="$?"
+popd > /dev/null
+rm -rf $WRKDIR
+
+[ "$RESULT" == "0" ] && echo "$DISTDIR/$NAME$SUFX"
+exit $RESULT

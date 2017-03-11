@@ -1,0 +1,9 @@
+net-misc/freerdp
+x11-apps/xrandr
+x11-base/xorg-server
+x11-misc/fbpanel
+x11-misc/hsetroot
+x11-misc/obconf
+x11-misc/slim
+x11-terms/xterm
+x11-wm/openbox

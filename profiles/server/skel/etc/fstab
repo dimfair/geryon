@@ -1,0 +1,7 @@
+# <fs>			<mountpoint>	<type>		<opts>		<dump/pass>
+
+tmpfs                   /run            tmpfs           defaults,size=4M                0 0
+tmpfs                   /srv            tmpfs           defaults,size=4M                0 0
+#tmpfs                   /tmp            tmpfs           defaults,size=4G,nr_inodes=256K 0 0
+#tmpfs                   /var/tmp        tmpfs           defaults,size=4G,nr_inodes=256K 0 0
+

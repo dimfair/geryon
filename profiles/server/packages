@@ -1,0 +1,39 @@
+# base 
+app-admin/logrotate
+app-admin/syslog-ng
+app-admin/sysstat
+app-admin/tmpwatch
+app-admin/webapp-config
+app-misc/screen
+sys-process/vixie-cron
+net-misc/dhcpcd
+net-misc/ntp
+
+# servers
+app-emulation/phpvirtualbox
+app-emulation/virtualbox-bin
+dev-db/mysql
+dev-db/phpmyadmin
+sys-apps/lm_sensors
+sys-apps/smartmontools
+sys-fs/cryptsetup
+sys-fs/lvm2
+sys-fs/mdadm
+net-fs/samba
+net-fs/cifs-utils
+net-p2p/transmission
+www-servers/lighttpd
+net-fs/nfs-utils
+net-ftp/vsftpd
+www-apps/phpsysinfo
+
+# x11 base
+net-misc/freerdp
+x11-apps/xrandr
+x11-base/xorg-server
+x11-misc/fbpanel
+x11-misc/hsetroot
+x11-misc/obconf
+x11-misc/slim
+x11-terms/xterm
+x11-wm/openbox

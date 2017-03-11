@@ -1,0 +1,49 @@
+#!/sbin/runscript
+
+HOMEDIR=/home
+CACHEDIR=/var/cache
+TEMPDIR=/var/tmp
+
+depend()
+{
+	after localmount
+}
+
+start()
+{
+	ebegin "Create user temp dirs"
+	for h in $(ls ${HOMEDIR}); do
+	  if [ -d ${HOMEDIR}/${h} ]; then
+
+	    # cretae TEMPDIR/USERDIR
+	    if [ ! -e ${CACHEDIR} ]; then
+	      mkdir -p ${CACHEDIR}
+	    fi
+
+	    # create dir for the user being iterated
+	    mkdir -p ${CACHEDIR}/${h}/.cache
+	    chmod -R --reference=/home/${h} ${CACHEDIR}/${h}
+	    chown -R --reference=/home/${h} ${CACHEDIR}/${h}
+
+	    mkdir -p ${TEMPDIR}/${h}
+            chmod -R --reference=/home/${h} ${TEMPDIR}/${h}
+            chown -R --reference=/home/${h} ${TEMPDIR}/${h}
+
+	    # recreate .cache link in real user dir
+	    DIR="$(readlink ${HOMEDIR}/${h}/.cache)"
+	    if [ ! -h "${HOMEDIR}/${h}/.cache" -o "x${DIR}" != "x${CACHEDIR}/${h}/.cache" ]; then
+		rm -rf "${HOMEDIR}/${h}/.cache" 2>/dev/null
+		ln -s "${CACHEDIR}/${h}/.cache" "${HOMEDIR}/${h}/.cache"
+	    fi
+	  fi
+	done
+
+	eend 0
+}
+
+stop()
+{
+	ebegin "Wiping user temp dirs"
+	rm -rf ${TEMPDIR}/${USERDIR}
+	eend 0
+}

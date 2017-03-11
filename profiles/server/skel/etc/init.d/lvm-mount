@@ -1,0 +1,94 @@
+#!/sbin/runscript
+# lvm-mount
+
+# LV_MNTDIR - mountpoint dir [/mnt/]
+# LV_PREFIX - prefix for LV mount ppoints ['_']
+
+MTAB=/run/lvm-mount.mtab
+
+depend() {
+
+	after lvm
+
+}
+
+do_mount_volumes() {
+
+	[ -n "$LV_MNTDIR" ] || LV_MNTDIR="/srv"
+	[ -n "$LV_PREFIX" ] || LV_PREFIX="_"
+
+	> $MTAB
+
+	echo "$(lvs -o lv_name,lv_path,lv_active --noheadings --nosuffix)" | \
+	while read ln; do
+
+		local name=$(echo $ln | cut -d' ' -f1)
+		local path=$(echo $ln | cut -d' ' -f2)
+		local stat=$(echo $ln | cut -d' ' -f3)
+
+		if [ "$stat" == "active" ]; then
+			local mpath=$LV_MNTDIR/$LV_PREFIX$name
+			if echo $(blkid -p $path) | grep -q "USAGE=\"filesystem\""; then
+
+				eindent
+				einfo "$path -> $mpath"
+				eoutdent
+
+				mkdir -p $mpath && mount -t auto $path $mpath && echo "$mpath" >> $MTAB
+			fi
+		fi
+	done
+
+}
+
+do_umount_volumes() {
+	if [ -e $MTAB ]; then
+		while read ln; do
+
+			eindent
+			einfo $ln
+			eoutdent
+
+			umount $ln
+		done < $MTAB
+
+		rm -f $MTAB
+	fi
+}
+
+is_dm_available() {
+
+	grep -q 'device-mapper' /proc/devices ||
+	grep -q 'device-mapper' /proc/misc
+
+}
+
+vgs_info(){
+
+	vgs -o vg_name --noheadings --nosuffix 2>/dev/null
+
+}
+
+start() {
+
+	einfo "Auto-mount LVM active volumes:"
+	do_mount_volumes
+	eend $?
+
+	#[ -e /proc/modules ] && ! is_dm_available &&  modprobe dm-mod 2>/dev/null
+
+	#if [ -d /proc/lvm ] || is_dm_available ; then
+
+	#	pvscan 				 >$SRV_LOGFILE 2>&1 &&
+	#	vgscan --mknodes		>>$SRV_LOGFILE 2>&1 &&
+	#	vgchange --sysinit -a ly 	>>$SRV_LOGFILE 2>&1 &&
+	#	do_mount_volumes
+
+	#fi
+}
+
+stop() {
+	einfo "Umount LVM volumes:"
+	do_umount_volumes
+	eend $?
+}

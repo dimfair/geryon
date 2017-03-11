@@ -1,0 +1,824 @@
+#!/bin/sh
+
+[ -f /etc/portage/make.conf ] && source /etc/portage/make.conf
+[ -f /var/lib/bootlog ] && source /var/lib/bootlog
+
+SCRIPT="$0"
+BASEDIR=$(dirname $(readlink -f $SCRIPT))
+PROFILESDIR="$BASEDIR/profiles"
+GERYON_SHARE_DIR=${GERYON_SHARE_DIR:-/usr/share/geryon}
+
+# configuration
+BOOTLOG="/var/lib/bootlog"
+
+# common params
+IMAGEFILE=
+PKGLIST=
+
+# global options
+KEEPWRK="no"
+PRETEND="no"
+
+# initrd options
+BUSYBOX=
+KRELEASE="$(uname -r)"
+
+#list options
+LISTPKG="no"
+BRANCH=
+
+# mkrootfs options
+PROFILE=
+DEVTOOLS="no"
+SKELDIR=
+STAGE3TAR=
+EXCLUDEPKGS=
+EXCLUDEFILES=
+WEBAPPS=
+
+ACTION=
+
+## 
+## Utility functions
+##
+
+# read params from the given file
+# $1 - file name (can be prefixed by '@' sign which is ignored)
+# $2 - delimiter (can be omitted, comma by default)
+# prints comma (by default) delimited list of file content
+read_from_file() {
+	local _fn=${1#*@}
+	local _fl=0
+	while read line; do
+		line=$(echo $line | sed -e "s/#.*$//" -e "s/^\s*//" -e "/^$/d")
+		if [ -n "$line" ]; then
+			[ "$_fl" == "1" ] && echo -n "${2-,}"
+			echo -n "$line"
+			_fl=1
+		fi
+	done < $_fn
+}
+
+# parses full qual package name given in following form:
+# [CATEGORY]/NAME[-VER]
+#
+# Prints delimited list of name parts: CATEGORY:NAME:VER
+# Omitted parts are printed as * (bash-4.2 -> '*:bash:4.2; bash -> '*:bash:*')
+parse_pkgname() {
+        local _param=$(echo $1 | sed -e "s/\(^.*\)-\([0-9]\)/\1:\2/")	# splits to CAT/NAME and VER with : as delimiter
+        local _pp=${_param%:*}	# CAT/NAME
+        local _pn=${_pp#*/}	# NAME
+
+        if echo $_param | grep -q "/"; then
+                local _pc=${_param%/*}
+        fi
+
+        if echo $_param | grep -q ":"; then
+                local _pv=${_param##*:}
+        fi
+
+        echo "${_pc-*}:${_pn}:${_pv-*}"
+}
+
+# prints path to package db dir (/var/db/pkg/CATEGORY/PACKAGE)
+# $1 - [CATEGORY/]PACKAGE[-VER]
+# $2 - path to pkgdb (/var/db/pkg for the rootfs as example)
+pkgdir() {
+	local _db="${2}/var/db/pkg"
+        local _pp=$(parse_pkgname $1)
+	local _pc=$(echo $_pp | cut -f1 -d':')
+	local _pn=$(echo $_pp | cut -f2 -d':')
+	local _pv=$(echo $_pp | cut -f3 -d':')
+
+	if [ "$_pc" != "*" ]; then
+		_db="$_db/$_pc"
+	fi
+
+	find $_db -name "$_pn-$_pv" -type d | grep -E "$_pn-[0-9]"
+}
+
+# removes all files wich belong to the given package
+# $1 - package name in form [CATEGORY/]PACKAGE[-VER]
+# $2 - path to pkgdb (/var/db/pkg for the rootfs as example)
+rmpkg() {
+	for _ppath in $(pkgdir $1 $2); do
+		if [ -f $_ppath/CONTENTS ]; then
+			echo "$(basename $(dirname $_ppath))/$(basename $_ppath)"
+
+			while read line; do
+				if echo $line | grep -qE "^obj|^sym "; then 
+					rm "${2}/$(echo $line | cut -f2 -d' ')"
+				fi
+			done < $_ppath/CONTENTS
+
+			for i in $(while read line; do
+        		        	if echo $line | grep -qE "^dir "; then
+                		        	echo "${2}$(echo $line | cut -f2 -d' ')"
+	                		fi
+		        		done < $_ppath/CONTENTS | sort -r); do
+				rmdir $i 2>/dev/null
+			done
+
+			rm -rf $_ppath
+		fi
+	done
+}
+
+# clean up rootfs before squashing
+# $1 - rootfs dir
+clean_rootfs() {
+	rm -rf $1/etc/*- $1/etc/dhcpcd.duid $1/etc/mtab $1/etc/resolv.conf
+	rm -rf $1/home/* $1/run/* $1/tmp/* $1/var/lib/gentoo/* $1/var/tmp/* $1/var/cache/*
+	#rm -rf $1/lib*/modules/*
+	for i in $1/var/log $1/var/spool; do
+		find $i -type f | grep -vE ".keep.*" | xargs rm 2>/dev/null
+	done
+	# removing empty dirs
+	find $1 -type d -print | sort -r | xargs rmdir 2>/dev/null
+}
+
+##
+## Scripts
+##
+
+branch() {
+	if [ ! -d "$RW_ROOTFS0" ]; then
+		echo "Wrong RW_ROOTFS0 parameter"
+		exit 2
+	fi
+
+	if [ -z "$IMAGEFILE" ]; then
+		echo "No image file given."
+		exit 2
+	fi
+
+	local WRKDIR="$(mktemp --tmpdir -d branch.XXXX)"
+	if [ ! -d "$WRKDIR" ]; then
+		echo "Unable to create tmpdir"
+		exit 4
+	fi
+
+	IMAGEFILE="$(readlink -f $IMAGEFILE)"
+
+	if [ -e "$IMAGEFILE" ]; then
+		echo "$IMAGEFILE already exists"
+		exit 2
+	fi
+
+	for i in $(ls $RW_ROOTFS0 | grep -vE "dev|media|mnt|root|run|srv|sys|proc|tmp"); do
+		cp -a /.rootfs-rw/$i $WRKDIR
+	done
+	clean_rootfs $WRKDIR
+
+	pushd $WRKDIR
+	mksquashfs * $IMAGEFILE -b 1M -comp xz -Xdict-size 100% 
+	popd
+
+	[ "$KEEPWRK" == "no" ] && rm -rf "$WRKDIR" || echo "Do not forget to clean $WRKDIR"
+}
+
+deduplicate() {
+	if [ ! -d "$RW_ROOTFS0" ]; then
+		echo "Wrong RW_ROOTFS0 parameter"
+		exit 2
+	fi
+
+	local counter=0
+
+	for f in $(find $RW_ROOTFS0 -type f); do
+		local fn=$(echo $f | sed -e "s#$RW_ROOTFS0##")
+		for i in 0 1 2 3 4 5 6 7; do
+			local mnt="RO_ROOTFS$i"
+			mnt=${!mnt}
+			mnt=${mnt%:*}
+			if [ -d "${mnt}" -a -f "$mnt$fn" ]; then
+				local s0=$(md5sum $f         | cut -f1 -d' ')
+				local s1=$(md5sum $mnt$fn | cut -f1 -d' ')
+				if [ "$s0" == "$s1" ]; then
+					echo " * $(du -h $fn)" && counter="$((counter + 1))" && [ "$PRETEND" == "no" ] && rm -f $f 2>/dev/null
+				fi
+			fi
+		done
+	done
+
+	local done="no"
+	counter=0
+	while [ "$done" != "yes" ]; do
+		done="yes"
+		for p in $(find $RW_ROOTFS0 -mindepth 2 -type d -empty | sort); do
+			local d=$(echo $p | sed -e "s#$RW_ROOTFS0##")
+			for i in 0 1 2 3 4 5 6 7; do
+				local mnt="RO_ROOTFS$i"
+				mnt=${!mnt}
+				mnt=${mnt%:*}
+				[ -d "$mnt" -a -d "$mnt$d" ] && echo " * $d" && counter="$((counter + 1))" && [ "$PRETEND" == "no" ] && rmdir $p 2>/dev/null && done=no
+			done
+		done
+	done
+
+	[ "$counter" != "0" ] && echo -n "$counter duplicated dirs " && ( [ "$PRETEND" == "no" ] && echo "removed." || echo "found." )
+}
+
+gen_initrd() {
+
+	if ! which cpio >/dev/null; then
+		echo "No cpio found (did you emerge cpio)"
+		exit 2
+	fi
+
+	if [ ! -d "/lib/modules/$KRELEASE" ]; then
+		echo "No modules found in /lib/modules/$KRELEASE"
+		exit 2
+	fi
+
+        if [ ! -f "$GERYON_SHARE_DIR/initrd/init" ]; then
+                echo "$GERYON_SHARE_DIR/initrd/init not found"
+                exit 2
+        fi
+
+        if [ ! -f "$GERYON_SHARE_DIR/initrd/rcS" ]; then
+                echo "$GERYON_SHARE_DIR/initrd/rcS not found"
+                exit 2
+        fi
+
+	if [ -z "$BUSYBOX" ]; then
+		if [ -d "$PKGDIR" ]; then
+			BUSYBOX="$(find "$PKGDIR/sys-apps" -name "busybox-*.tbz2" | cut -f1 -d' ')"
+		fi
+	fi
+
+	if [ ! -e "$BUSYBOX" ]; then
+		echo "No busybox package found"
+		echo "Trying to build ..."
+		local PN=$(emerge -p busybox|grep sys-apps | sed -e "s#.*sys-apps/\(busybox[^ ]\+\).*#\1#")
+		if USE="make-symlinks" emerge -B busybox; then
+			BUSYBOX="$(find "${PKGDIR-/usr/portage/packages}/sys-apps" -name "$PN.tbz2" | cut -f1 -d' ')"
+		fi
+		if [ ! -e "$BUSYBOX" ]; then
+			echo "Cannot find busybox binary package $PN in ${PKGDIR-/usr/portage/packages}."
+			echo "Looks like busybox build failed, exiting ..."
+			exit 2
+		fi
+	fi
+
+	if [ -z "$IMAGEFILE" ]; then
+		IMAGEFILE="initrd-$KRELEASE"
+	fi
+	rm -f "$IMAGEFILE" 2>/dev/null
+	IMAGEFILE="$(readlink -f $IMAGEFILE)"
+
+	local WRKDIR="$(mktemp --tmpdir -d initrd.XXXX)"
+
+	echo "Install busybox ($BUSYBOX) ..."
+	tar -C $WRKDIR -xaf $BUSYBOX 2>/dev/null &&
+	tar -C $WRKDIR -xf $WRKDIR/usr/share/busybox/busybox-links.tar &&
+	rm $WRKDIR/usr/share/busybox/busybox-links.tar || exit 2
+
+	echo "Install kernel modules $KRELEASE ..."
+	mkdir -p $WRKDIR/lib/modules
+	cp -a /lib/modules/$KRELEASE $WRKDIR/lib/modules
+
+	echo "Populating filesystem..."
+	mkdir -p $WRKDIR/dev $WRKDIR/etc/init.d $WRKDIR/mnt $WRKDIR/proc $WRKDIR/sys
+	mknod -m 622 $WRKDIR/dev/console c 5 1
+	mknod -m 666 $WRKDIR/dev/null c 1 3
+	mknod -m 666 $WRKDIR/dev/tty c 5 0
+	for i in 0 1 2 3; do
+		mknod -m 666 $WRKDIR/dev/tty$i c 4 $i
+	done
+
+	echo "Compression ..."
+	cp $GERYON_SHARE_DIR/initrd/init $WRKDIR
+	cp $GERYON_SHARE_DIR/initrd/rcS $WRKDIR/etc/init.d
+
+	pushd $WRKDIR >/dev/null
+	find | cpio -o -H newc | gzip > "$IMAGEFILE" && echo "initrd image: $IMAGEFILE"
+	popd >/dev/null
+
+	[ "$KEEPWRK" == "yes" ] || rm -rf $WRKDIR
+}
+
+list() {
+	for i in $(cat $BOOTLOG | grep -E "^RO_ROOTFS" | cut -f2 -d=); do
+		local name="$(basename ${i#*:})" dir="${i/:*}"
+		if [ -z "$BRANCH" -o "x$name" == "x$BRANCH" ]; then
+			if [ "$LISTPKG" == "yes" ]; then
+				for p in $(find $dir/var/db/pkg -maxdepth 2 -mindepth 2 -type d); do
+					local PC=$(basename $(dirname $p))
+					local PN=$(basename $p)
+
+					echo "$name:$PC/$PN"
+				done
+			else
+				echo "$(basename $name) -> $dir"
+			fi
+
+		fi
+	done
+}
+
+is_subdir() {
+	# returns true if $2 is subdir of $1
+	let pd="$1" # $1 - possible parent dir
+	let sd="$2" # $2 - possible subdir
+}
+
+pre_chroot() {
+	mount --bind /dev $WRKDIR/dev
+	mount --bind /proc $WRKDIR/proc
+	mount --bind /sys $WRKDIR/sys
+
+	mkdir -p $WRKDIR/$PORTDIR
+	mount --bind $PORTDIR $WRKDIR/$PORTDIR
+
+	if ! echo "$PKGDIR" | grep -qE "^$PORTDIR"; then
+		mkdir -p $PKGDIR $WRKDIR/$PKGDIR
+		mount --bind $PKGDIR $WRKDIR/$PKGDIR
+	fi
+
+	if [ -e /usr/src/linux ]; then
+		mkdir -p $WRKDIR/usr/src
+		mount --bind /usr/src $WRKDIR/usr/src
+	fi
+
+	mkdir -p $WRKDIR/etc/portage
+	rm -rf $WRKDIR/etc/portage/*
+	cp -a /etc/portage/* $WRKDIR/etc/portage
+	cp /etc/resolv.conf $WRKDIR/etc
+}
+
+post_chroot() {
+	umount $WRKDIR/dev
+	umount $WRKDIR/proc
+	umount $WRKDIR/sys
+	umount $WRKDIR/$PORTDIR
+	umount $WRKDIR/$PKGDIR
+	umount $WRKDIR/usr/src
+
+	rm -rf $WRKDIR/usr/src/*
+	rm $WRKDIR/etc/resolv.conf
+}
+
+mkrootfs() {
+	if ! which mksquashfs >/dev/null 2>&1; then
+		echo "error: no mksquashfs found (\"emerge sys-fs/squashfs-tools\" can help you)"
+		exit 2
+	fi
+
+        if [ -z "$PROFILE" ]; then
+            echo "error: no profile given"
+            print_help
+            exit 2
+        fi
+
+	if [ ! -d "$PROFILESDIR/$PROFILE" ]; then
+		echo "error: no profile directory found: $PROFILE"
+		print_help
+		exit 2
+	fi
+
+	if [ -z "$STAGE3TAR" ]; then
+		echo "error: no stage3 file given"
+		print_help
+		exit 2
+	fi
+
+	if [ ! -f "$STAGE3TAR" ]; then
+		echo "error: no stage3 file found: $STAGE3TAR"
+		exit 2
+	fi
+
+	if [ -z "$IMAGEFILE" ]; then
+		echo "error: no image file name given"
+		print_help
+		exit 2
+	fi
+
+	if [ -e "$IMAGEFILE" ]; then
+		echo "error: $IMAGEFILE already exists"
+		exit 2
+	fi
+
+	##########################################################
+
+	if echo "$EXCLUDEPKGS" | grep -qE "^@"; then
+		EXCLUDEPKGS=$(read_from_file $EXCLUDEPKGS ",")
+	fi
+
+	if echo "$PKGLIST" | grep -qE "^ ?@"; then
+		PKGLIST=$(read_from_file $PKGLIST " ")
+	fi
+
+	if echo "$WEBAPPS" | grep -qE "^ ?@"; then
+		WEBAPPS=$(read_from_file $WEBAPPS " ")
+	fi
+
+	##########################################################
+
+	if [ -n "$PROFILE" -a -f "$PROFILESDIR/$PROFILE/packages" ]; then
+		PKGLIST="$(read_from_file "$PROFILESDIR/$PROFILE/packages" " ") $PKGLIST"
+	fi
+
+	if [ -n "$PROFILE" -a -f "$PROFILESDIR/$PROFILE/webapps" ]; then
+		WEBAPPS="$(read_from_file "$PROFILESDIR/$PROFILE/webapps" " ") $WEBAPPS"
+	fi
+
+	if [ -z "$SKELDIR" -a -n "$PROFILE" -a -d "$PROFILESDIR/$PROFILE/skel" ]; then
+		SKELDIR="$PROFILESDIR/$PROFILE/skel"
+	fi
+
+	if [ ! -e "$SKELDIR" ]; then
+		echo "$PROFILE $PROFILESDIR"
+		echo "No skeleton dir/tar found: $SKELDIR"
+		print_help
+		exit 2
+	fi
+
+
+	echo "Image file  : $(readlink -f $IMAGEFILE)"
+	echo "PKGDIR      : $PKGDIR"
+	echo "Stage3 file : $(readlink -f $STAGE3TAR)"
+	echo "Profile dir : $PROFILESDIR"
+	echo "Skeleton    : $(readlink -f $SKELDIR)"
+	[ -n "$PKGLIST" ]	&& echo "Aux packages: $PKGLIST"
+	[ -n "$WEBAPPS" ]	&& echo "Webapps     : $WEBAPPS"
+	[ -n "$EXCLUDEPKGS" ]	&& echo "Exclude list: $EXCLUDEPKGS"
+	[ "$PRETEND" != "no" ] && exit 0
+	echo
+
+	local WRKDIR="$(mktemp --tmpdir -d rootfs.XXXX)"
+	if [ ! -d "$WRKDIR" ]; then
+		echo "Unable to create tmpdir"
+		exit 4
+	fi
+
+	STATUS="1"
+
+	echo "Unpacking stage3 ..."
+	tar -C "$WRKDIR" -xaf $STAGE3TAR && STATUS="0"
+
+	if [ "$STATUS" == "0" -a -z "$NO_UPDATE" ]; then
+		echo "Update packages ..."
+		rm -f $WRKDIR/emerge-pkg-ok 2>/dev/null
+		pre_chroot
+		chroot $WRKDIR /bin/bash -c "PKGDIR=$PKGDIR emerge --quiet-build --buildpkg --usepkg --update --newuse --deep world && touch /emerge-pkg-ok"
+		post_chroot
+		rm $WRKDIR/emerge-pkg-ok 2>/dev/null && STATUS="0"
+	fi
+
+
+
+	if [ -n "$PKGLIST" ]; then
+		STATUS=1
+		# link /usr/src/* to WRKDIR/usr/src (need if we have to use configured kernel to build pkgs)
+		mkdir -p $WRKDIR/usr/src
+		for i in /usr/src/*; do
+			ln -s $i $WRKDIR/$i
+		done
+		echo "Install packages:"
+
+cat <<EOF > $WRKDIR/mkrootfs.sh
+#!/bin/sh
+
+PKGDIR=$PKGDIR emerge --quiet-build y --buildpkg --usepkg $PKGLIST &&
+emerge -D --depclean &&
+touch  /emerge-pkg-ok
+
+if [ -n "$WEBAPPS" ]; then
+	echo " * Webapps install ..."
+	WEBSRV=$WEBSRV
+	[ -z "\$WEBSRV" ] && which apache   >/dev/null 2>&1 && WEBSRV=apache
+	[ -z "\$WEBSRV" ] && which lighttpd >/dev/null 2>&1 && WEBSRV=lighttpd
+
+	if [ -z "\$WEBSRV" ]; then
+		echo " * no web server installed"
+		exit
+	fi
+
+	result=0
+	webappsConfigEmerged="no"
+	if ! which webapps-config >/dev/null 2>&1 ; then
+		echo " * No webapps-config found in rootfs, buiding ..."
+		PKGDIR=$PKGDIR emerge --quiet-build y --buildpkg --usepkg -1 webapp-config
+		result=\$?
+		[ "\$result" == "0" ] && webappsConfigEmerged="yes"
+	fi
+
+	for p in $WEBAPPS; do
+		pn=\$(echo "\$p" | cut -f1  -d':')
+		pd=\$(echo "\$p" | cut -sf2 -d':')
+		pv=\$(echo "\$p" | cut -sf3 -d':')
+
+		[ -z "\$pv" ] && pv="\$(ls /usr/share/webapps/\$pn | head -n1)"
+		[ -z "\$pd" ] && pd="\$pn"
+		webapp-config -I \$pn \$pv -s \$WEBSRV -d \$pd
+	done
+
+	[ "\$webappsConfigEmerged" == "yes" ] && emerge -C webapp-config
+fi
+
+[ -e "$PROFILESDIR/$PROFILE/setup.sh" ] && sh "$PROFILESDIR/$PROFILE/setup.sh"
+
+EOF
+		chmod +x $WRKDIR/mkrootfs.sh
+		rm -f $WRKDIR/emerge-pkg-ok
+		pre_chroot
+		chroot $WRKDIR /bin/bash -c /mkrootfs.sh
+		post_chroot
+		rm -f $WRKDIR/mkrootfs.sh
+		rm $WRKDIR/emerge-pkg-ok 2>/dev/null && STATUS=0
+	fi
+
+	if [ "$STATUS" == "0" -a -n "$EXCLUDEPKGS" ]; then
+		echo "Removing packages from rootfs:"
+		local _sz1=$(du -sh $WRKDIR|cut -f1)
+
+		if true; then
+			EXCLUDEPKGS="$(echo "$EXCLUDEPKGS" | tr ',' ' ')"
+			pre_chroot
+			chroot $WRKDIR /bin/bash -c "emerge --rage-clean $EXCLUDEPKGS && touch /emerge-pkg-ok"
+			post_chroot
+			rm $WRKDIR/emerge-pkg-ok 2>/dev/null && STATUS=0
+		else
+			if echo "$EXCLUDEPKGS" | grep -qE "^@"; then
+				EXCLUDEPKGS=$(read_from_file $EXCLUDEPKGS)
+			fi
+			for pkg in $(echo "$EXCLUDEPKGS" | tr "," " "); do
+				echo -n "    "
+				rmpkg $pkg $WRKDIR
+			done
+		fi
+		local _sz2=$(du -sh $WRKDIR|cut -f1)
+		echo "    Size reduction: $_sz1 -> $_sz2"
+	fi
+
+	if [ "$STATUS" == "0" -a  -n "$EXCLUDEFILES" ]; then
+		echo "Removing misc files:"
+		local _sz1=$(du -sh $WRKDIR|cut -f1)
+
+		if echo "$EXCLUDEFILES" | grep -qE "^@"; then
+			EXCLUDEFILES=$(read_from_file $EXCLUDEFILES)
+		fi
+
+
+		set -f
+		for pat in $(echo "$EXCLUDEFILES" | tr "," " "); do
+			echo "    $pat"
+			local _fd=$(dirname "$pat")
+			local _fn=$(basename "$pat")
+			find $WRKDIR/$_fd -name "$_fn"  | xargs rm -rf
+		done
+		set +f
+
+		local _sz2=$(du -sh $WRKDIR|cut -f1)
+		echo "    Size reduction: $_sz1 -> $_sz2"
+	fi
+
+	if [ "$STATUS" == "0" ]; then
+		clean_rootfs $WRKDIR
+
+		echo "Copying files ..."
+		if [ "$DEVTOOLS" == "yes" ]; then
+			mkdir -p $WRKDIR/usr/share
+			cp -a $GERYON_SHARE_DIR $WRKDIR/usr/share
+			cp $SCRIPT $WRKDIR/usr/share/geryon
+			cp /etc/portage/make.conf /etc/portage/package.* $WRKDIR/etc/portage
+		fi
+
+		if [ -d "$SKELDIR" ]; then
+			cp -a $SKELDIR/* $WRKDIR
+		elif [ -f "$SKELDIR" ]; then
+			tar -C $WRKDIR -xaf $SKELDIR
+		elif [ -f "${SKELDIR}.tbz2" ]; then
+			tar -C $WRKDIR -xaf ${SKELDIR}.tbz2
+		fi
+
+		if [ "$?" == "0" ]; then
+			if [ -f "$WRKDIR/etc/passwd" -a ! -f "$SKELDIR/etc/passwd" ]; then
+				echo "Emptying the root's password ..."
+				sed -i -e 's/^root:x:/root::/g' $WRKDIR/etc/passwd
+			else
+				true
+			fi
+		fi
+
+		if [ "$?" == "0" ]; then
+			echo "Calculating checksum ..."
+			tar cf - $WRKDIR 2>/dev/null | md5sum | cut -f1 -d' ' > $WRKDIR/.hash
+			echo "Squashing ..."
+			IMAGEFILE="$(readlink -f $IMAGEFILE)"
+			pushd $WRKDIR >/dev/null
+			mksquashfs * .hash $IMAGEFILE -b 1M -comp xz -Xdict-size 100%
+			popd >/dev/null
+		else
+			echo "Copying failed, exiting ..."
+		fi
+	fi
+
+	[ "$KEEPWRK" == "no" ] && rm -rf "$WRKDIR" || echo "Do not forget to clean $WRKDIR"
+}
+
+print_help() {
+cat <<HELP
+Usage: $(basename $SCRIPT) [global_opts=value ...] <action> [ ... ]
+    Actions:
+	(b)ranch	- convert current rw branch to ro branch
+	(d)eduplicate	- remove duplicated files from rw branch
+	(i)nitrd	- create initrd boot image
+	(l)ist		- list installed packages in active branches
+	(r)ootfs	- create minimal rootfs image
+
+    Global option:
+	--help|-h	- print help and exit
+	--keep|-k	- keep working dir
+	--pretend|-p	- do not perform any changes, just print what would be done without -p
+
+    branch params:
+	<image>		- image file name
+
+    initrd params:
+	--busybox-pkg	- path to busybox package ($GERYON_SHARE_DIR/busybox-*.tbz2 by default)
+	--kernel-ver	- kernel version ('$KRELEASE' by default)
+	[ <image> ]	- initrd image file (initrd-$KRELEASE by default)
+
+    list options:
+	--packages|-p	- list packages which are belongs to branch
+	[ branch ]	- list only the given branch
+
+    rootfs params:
+	--copy-tools	- copy $GERYON_SHARE_DIR to rootfs being created
+	--pkgdir	- where to find binary packages ($PKGDIR by default)
+	--stage3-tar	- path to gentoo stage3 tar file
+	--profile	- profile name (a directory in $BASEDIR/profiles)
+	<image>		- image filename
+	[ pkgspec ... ]	- aux bin packages list which will be installed into rootfs image
+
+    	Advanced parameters (you should know what you are doing)
+	--skel		- path to rootfs skeleton dir/tar ($SKELDIR by default)
+	--exclude-pkgs	- comma-delimited list of packages to exclude or
+			  path to file which contains package list (one package per line)
+			  filename should be prefixed by @-sign
+	--exclude-files - comma-delimited list of filename patterns to exclude from
+			  final image or path to file which contains pattern list
+			  (one package per line) filename should be prefixed by @-sign
+	--no-update	- do not update packages after stage3 tar unpacking
+	--webapps	- list of web apps to install using webapps-config
+
+    Environment variables:
+        GERYON_SHARE_DIR	- Location of resources, scripts and assets
+                                  ($GERYON_SHARE_DIR)
+HELP
+}
+
+parse_cmdline() {
+	local state="global_options"
+
+	for i in $*; do
+		if [ "$state" == "global_options" ]; then
+			case "$i" in
+				--help|-h)
+					print_help
+					exit ;;
+
+				--keep|-k)
+					KEEPWRK="yes"
+					continue ;;
+
+				--pretend|-p)	
+					PRETEND="yes"
+					continue ;;
+
+				*)
+					state="actions"
+					;;
+			esac
+		fi
+
+		if [ "$state" == "actions" ]; then
+			case "$i" in
+				branch|b)
+					ACTION="branch"
+					state="branch_opts"
+					continue
+					;;
+				deduplicate|d)
+					ACTION="deduplicate"
+					continue
+					;;
+				initrd|i)
+					ACTION="initrd"
+					state="initrd_opts"
+					continue
+					;;
+				list|l)		
+					ACTION="list"
+					state="list_opts" 
+					continue
+					;;
+				rootfs|r)
+					ACTION="rootfs"
+					state="rootfs_opts"
+					continue
+					;;
+				*)	echo "Unknown action: $i"
+					exit 2
+					;;
+			esac
+		fi
+
+		if [ "$state" == "branch_opts" ]; then
+			[ -z "$IMAGEFILE" ] && IMAGEFILE="$i" || echo "Unknown parameter: $i"
+		fi
+
+		if [ "$state" == "initrd_opts" ]; then
+			case "$i" in
+				--busybox-pkg=*)
+					BUSYBOX="${i#*=}"
+					continue ;;
+				--kernel-ver=*)
+					KRELEASE="${i#*=}"
+					continue ;;
+				*)
+					if [ -z "$IMAGEFILE" ]; then
+						IMAGEFILE=$i
+						continue
+					else
+						echo "Wrong parameter: $i"
+						exit 2
+					fi ;;
+			esac
+		fi
+
+		if [ "$state" == "list_opts" ]; then
+			case "$i" in
+				--packages|-p)
+					LISTPKG="yes"
+					continue ;;
+				*)	if [ -n "$BRANCH" ]; then
+						echo "Unknown paramenter $i"
+						exit 2
+					fi
+					BRANCH="$i" 
+					continue ;;
+			esac
+		fi
+
+		if [ "$state" == "rootfs_opts" ]; then
+			case "$i" in
+				--copy-tools)
+					DEVTOOLS="yes"
+					continue ;;
+				--no-update)
+					NO_UPDATE="yes"
+					continue ;;
+				--pkgdir=*)
+					PKGDIR=${i#*=}
+					continue ;;
+				--profile=*)
+					PROFILE=${i#*=}
+					continue ;;
+				--skel=*)
+					SKELDIR=${i#*=}
+					continue ;;
+				--stage3-tar=*)
+					STAGE3TAR=${i#*=}
+					continue ;;
+				--exclude-pkgs=*)
+					EXCLUDEPKGS=${i#*=}
+                                        continue ;;
+				--exclude-files=*)
+					EXCLUDEFILES="${i#*=}"
+					continue ;;
+				--webapps=*)
+					WEBAPPS="${i#*=}"
+					continue ;;
+				*)
+					[ -z "$IMAGEFILE" ] && IMAGEFILE="$i" || PKGLIST="$PKGLIST $i"
+					continue ;;
+			esac
+		fi
+
+		echo "Unknown option: $i"
+	done
+}
+
+
+parse_cmdline $*
+case "$ACTION" in
+	"branch")
+		branch ;;
+	"deduplicate")
+		deduplicate ;;
+	"initrd")
+		gen_initrd ;;
+	"list")
+		list ;;
+	"rootfs")
+		mkrootfs ;;
+	*)
+		echo "Unknown action: $ACTION"
+		print_help
+		;;
+esac
+
+

@@ -1,0 +1,7 @@
+#!/bin/sh
+
+# prepare /etc/init.d/net.* links
+for i in $(cat /proc/net/dev | grep -E '^.+:.+'|grep -vE 'lo|dummy.+'|sed -r 's/^ *(.+):.+/\1/g')
+do
+    [ -h "/etc/init.d/net.$i" ] || ln -s net.lo "/etc/init.d/net.$i" 
+done

@@ -1,0 +1,119 @@
+#!/sbin/runscript
+
+DEF_EXCLUDE_PATTERNS="*- *~ *.bak .wh.*"
+DEF_EXCLUDE_DIRS="/lib*/modules/* /tmp /usr/portage /usr/src /var/cache /var/empty/* /var/spool/* /var/tmp"
+DEF_TAR_OPTS='--one-file-system --totals --wildcards --wildcards-match-slash'
+
+TAGFILE=".${RC_SVCNAME}-excluded-dir"
+
+COMPRESSOR="j"		# tar compressor option: [zjJ]
+
+[ -f "/var/lib/bootlog" ] && source /var/lib/bootlog
+[ -f "/etc/conf.d/${RC_SVCNAME}" ] && source /etc/conf.d/${RC_SVCNAME}
+
+TAR_OPTS=${TAR_OPTS:-$DEF_TAR_OPTS}
+EXCLUDE_PATTERNS=${EXCLUDE_PATTERNS:-$DEF_EXCLUDE_PATTERNS}
+EXCLUDE_DIRS=${EXCLUDE_DIRS:-$DEF_EXCLUDE_DIRS}
+
+for i in $EXCLUDE_PATTERNS; do
+	EXCLUDE_OPT=" $EXCLUDE_OPT --exclude='$i'"
+done
+
+for i in $EXCLUDE_DIRS; do
+	[ -d "$i" ] && touch "$i/$TAGFILE" 2>/dev/null
+done
+EXCLUDE_OPT="$EXCLUDE_OPT --exclude-tag-under=$TAGFILE"
+
+CONFIG=${CONFIG0%:*}
+
+pack_data() {
+	local SRC=$1	# source directory
+	local DST=$2	# destination tar file
+
+	rm -f $DST &&
+	pushd $SRC > /dev/null &&
+	local dirs=$(ls | grep -vE "dev|media|mnt|root|run|srv|sys|proc|tmp") &&
+	tar $TAR_OPTS ${EXCLUDE_OPT} -c${COMPRESSOR}f $DST $(echo $dirs) 2>&1 &&
+	popd >/dev/null
+}
+
+depend() {
+	before *
+}
+
+start() {
+	ebegin "Starting persistent data storage"
+
+	# create default config file with trivial params
+	[ -f "/etc/conf.d/${RC_SVCNAME}" ] || {
+cat <<EOF > "/etc/conf.d/${RC_SVCNAME}"
+# space separated list of file patterns which should be EXCLUDED from saving
+EXCLUDE_PATTERNS="$DEF_EXCLUDE_PATTERNS"
+
+# space separated list of dirs which should be excluded from saving
+EXCLUDE_DIRS="$DEF_EXCLUDE_DIRS"
+
+
+# options list for tar (change if you really understand what you are doing)
+TAR_OPTS='$DEF_TAR_OPTS'
+
+# space separated files list
+# files, listed below, will be catenated frome the same files in rootfs branches
+# into single file at system start
+# Exapmle:
+# cat /var/lib/portage/world /.rootfs0-ro/var/lib/portage/world | sort | uniq > /var/lib/portage/world
+CATENATE=/var/lib/portage/world
+EOF
+	}
+
+	local roots=
+	for i in {0..8}; do
+		local dir1="RO_ROOTFS$i"
+		local dir2="RW_ROOTFS$i"
+		[ -d "${!dir1}" ] && roots="$roots ${!dir1}"
+		[ -d "${!dir2}" ] && roots="$roots ${!dir2}"
+	done
+
+	for f in ${CATENATE}; do
+		local flist=
+		for d in ${roots}; do
+			[ -f "${d}/${f}" ] && flist="$flist ${d}/${f}"
+		done
+
+		mkdir -p "$(dirname ${f})"
+		[ -n "${flist}" ] && cat ${flist} | sort | uniq > "${f}-" && 
+		mv "${f}-" "${f}"
+	done
+	
+	eend 
+}
+
+stop() {
+	ebegin "Stopping persistent data storage"
+
+	local D="/.bootdev"
+
+	if [ ! -b "${BOOTDEV}" ]; then
+		eend "BOOTDEV='${BOOTDEV}' isn't a valid block device"
+		exit 1
+	fi
+
+	if [ ! -d "$RW_ROOTFS0" ]; then
+		eend "RW_ROOTFS0='$RW_ROOTFS0' is not valid writable rootfs branch"
+		exit 1
+	fi
+
+	if mkdir -p ${D} && mount -t auto ${BOOTDEV} ${D}; then
+		eindent
+		[ -f "${D}${CONFIG}" ] && mv "${D}${CONFIG}" "${D}${CONFIG}~"
+		einfo "(bootdev)$CONFIG:"
+		local msg=$(pack_data $RW_ROOTFS0 "${D}${CONFIG}")
+		local errcode="$?"
+		einfo "    $msg"
+		umount ${D}
+		eend $errcode
+	else
+		eerror "Unable to mount ${BOOTDEV}"
+	fi
+}
+

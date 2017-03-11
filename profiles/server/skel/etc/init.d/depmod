@@ -1,0 +1,11 @@
+#!/sbin/openrc-run
+
+description="Executes depmod command before modprobes in /etc/init.d/modules."
+
+depend() {
+	before modules
+}
+
+start() {
+	depmod
+}

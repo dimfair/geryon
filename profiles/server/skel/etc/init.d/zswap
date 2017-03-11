@@ -1,0 +1,54 @@
+#!/sbin/runscript
+
+#SWAP_SIZE="2048"	# in megabytes
+SWAP_SIZE="50%"		# 50% of phys RAM by default
+
+[ -f /etc/conf.d/zswap ] && source /etc/conf.d/zswap
+
+start(){
+	local dev_size="0"
+	local dev_count=$(cat /proc/cpuinfo|grep processor|wc -l)
+
+        if   echo $SWAP_SIZE|grep -q "^[1-9][0-9]*%$"; then
+		local pcent=$(echo $SWAP_SIZE|sed 's/%//')
+		dev_size=$(($pcent*$(cat /proc/meminfo |head -n1|sed  's/[^0-9]*//g')/102400))
+	elif echo $SWAP_SIZE|grep -q "^[1-9][0-9]*$"; then
+		dev_size=$SWAP_SIZE
+	fi
+
+	ebegin "Init swap in zram device(s)"
+
+	if echo $dev_count|grep -q "^[1-9][0-9]*$" &&
+	   echo $dev_size |grep -q "^[1-9][0-9]*$"; then
+		dev_size=$(($dev_size/$dev_count))
+
+		eindent
+
+		modprobe -r zram
+		modprobe zram num_devices=$dev_count
+
+		for i in $(seq 0 $(($dev_count-1))); do
+			if [ -b /dev/zram$i ]; then
+				ebegin "/dev/zram$i ($dev_size kB)"
+				echo $(($dev_size*1024*1024)) > /sys/block/zram$i/disksize
+				mkswap /dev/zram$i >/dev/null
+				swapon /dev/zram$i -p 10 >/dev/null
+				eend $?
+			fi
+		done
+	fi
+
+	eend $?
+}
+
+stop(){
+	ebegin "Stopping swap in zram device(s)"
+	eindent
+	for dev in $(cat /proc/swaps|tail -n +2|grep -E "^/dev/zram[0-9]+"|cut -f1 -d' '); do
+		ebegin "$dev"
+		swapoff $dev
+		eend $?
+	done
+	modprobe -r zram
+}
+

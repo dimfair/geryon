@@ -1,0 +1,8 @@
+app-admin/logrotate
+app-admin/syslog-ng
+app-admin/sysstat
+app-admin/tmpwatch
+sys-process/vixie-cron
+net-misc/dhcpcd
+net-misc/ntp
+

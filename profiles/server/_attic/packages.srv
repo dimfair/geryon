@@ -1,0 +1,16 @@
+app-emulation/phpvirtualbox
+app-emulation/virtualbox-bin
+dev-db/mysql
+dev-db/phpmyadmin
+sys-apps/lm_sensors
+sys-apps/smartmontools
+sys-fs/cryptsetup
+sys-fs/lvm2
+sys-fs/mdadm
+net-fs/samba
+net-fs/cifs-utils
+net-p2p/transmission
+www-servers/lighttpd
+net-fs/nfs-utils
+net-ftp/vsftpd
+www-apps/phpsysinfo

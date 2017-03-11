@@ -1,0 +1,25 @@
+#!/bin/sh
+
+banner="Create default user accounts: "
+
+if ! cat /etc/group | grep -qE "^users:"; then
+	echo -n "Creating default users group ... " &&
+	groupadd -f users >/dev/null 2>&1 &&
+	echo "ok" || echo "failed"
+fi
+
+if ! cat /etc/passwd | grep -qE "^admin:"; then
+	echo -n "Creating admin account ... " &&
+	useradd -g wheel -G audio,video,usb,users -mN admin >/dev/null 2>&1 &&
+	echo "admin:admin" | chpasswd &&
+	chage -d 0 admin &&
+	echo "ok" || echo "failed"
+fi
+
+if ! cat /etc/passwd | grep -qE "^xuser:"; then
+        echo -n "Creating default user account ... " &&
+        useradd -g users -G audio,video,usb -mN xuser >/dev/null 2>&1 &&
+        passwd -qd xuser &&
+        echo "ok" || echo "failed"
+fi
+
